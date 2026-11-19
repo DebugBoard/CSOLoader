@@ -13,6 +13,8 @@
 #include "elf_util.h"
 
 #define MAX_DEPS 64
+#define MAX_ATEXIT_SLOTS 8
+#define MAX_ATEXIT_ENTRIES 512
 
 struct tls_indices_data {
   void **indices;
@@ -43,6 +45,10 @@ struct linker {
 
   size_t main_map_size;
   bool is_linked;
+
+  /* INFO: __cxa_atexit GOT entries, pointed back to libc after constructors. */
+  ElfW(Addr) *atexit_slots[MAX_ATEXIT_SLOTS];
+  int atexit_slot_count;
 };
 
 void *linker_load_library_manually(const char *lib_path, struct loaded_dep *dep_info);

@@ -179,6 +179,76 @@ static inline uintptr_t _page_end(uintptr_t addr) {
   return ALIGN_DOWN(addr + system_page_size - 1, system_page_size);
 }
 
+/* INFO: Constructor-time exit handlers, kept out of libc's table so unloading leaves no gap. */
+struct atexit_entry {
+  void (*func)(void *);
+  void *arg;
+  void *dso;
+};
+
+static struct atexit_entry g_atexit_entries[MAX_ATEXIT_ENTRIES];
+static size_t g_atexit_count = 0;
+static pthread_mutex_t g_atexit_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+extern int __cxa_atexit(void (*func)(void *), void *arg, void *dso);
+
+static int _linker_record_atexit(void (*func)(void *), void *arg, void *dso) {
+  pthread_mutex_lock(&g_atexit_mutex);
+
+  bool recorded = g_atexit_count < MAX_ATEXIT_ENTRIES;
+  if (recorded) g_atexit_entries[g_atexit_count++] = (struct atexit_entry){ func, arg, dso };
+
+  pthread_mutex_unlock(&g_atexit_mutex);
+
+  /* INFO: Table full, libc's still works, only leaving a gap if unloaded. */
+  if (!recorded) return __cxa_atexit(func, arg, dso);
+
+  return 0;
+}
+
+static bool _linker_contains(struct linker *linker, uintptr_t addr) {
+  uintptr_t main_base = (uintptr_t)linker->img->base;
+  if (addr >= main_base && addr < main_base + linker->main_map_size) return true;
+
+  for (int i = 0; i < linker->dep_count; i++) {
+    struct loaded_dep *dep = &linker->dependencies[i];
+    if (!dep->img || !dep->is_manual_load) continue;
+
+    uintptr_t dep_base = (uintptr_t)dep->img->base;
+    if (addr >= dep_base && addr < dep_base + dep->map_size) return true;
+  }
+
+  return false;
+}
+
+/* INFO: Runs this linker's handlers newest first, or hands them to libc in order. */
+static void _linker_release_atexit(struct linker *linker, bool run) {
+  pthread_mutex_lock(&g_atexit_mutex);
+
+  if (run) {
+    for (size_t i = g_atexit_count; i > 0; i--) {
+      struct atexit_entry *entry = &g_atexit_entries[i - 1];
+      if (_linker_contains(linker, (uintptr_t)entry->dso)) entry->func(entry->arg);
+    }
+  }
+
+  size_t kept = 0;
+  for (size_t i = 0; i < g_atexit_count; i++) {
+    struct atexit_entry entry = g_atexit_entries[i];
+    if (!_linker_contains(linker, (uintptr_t)entry.dso)) {
+      g_atexit_entries[kept++] = entry;
+
+      continue;
+    }
+
+    if (!run && __cxa_atexit(entry.func, entry.arg, entry.dso) != 0)
+      LOGE("Failed to hand exit handler %p of %s over to libc", entry.func, linker->img->elf);
+  }
+  g_atexit_count = kept;
+
+  pthread_mutex_unlock(&g_atexit_mutex);
+}
+
 #ifdef __LP64__
   /* INFO: Reserve size bytes in the highest free place below the stack, so we never take a
              place the system would later use, which would create a gap, a detection.
@@ -479,6 +549,7 @@ bool linker_init(struct linker *linker, struct csoloader_elf *img) {
   linker->is_linked = false;
   linker->main_map_size = 0;
   linker->dep_count = 0;
+  linker->atexit_slot_count = 0;
   memset(&linker->tls_indices, 0, sizeof(linker->tls_indices));
 
   memset(linker->dependencies, 0, sizeof(linker->dependencies));
@@ -531,6 +602,7 @@ void linker_destroy(struct linker *linker) {
 
   if (linker->is_linked) {
     _linker_call_destructors(linker->img);
+    _linker_release_atexit(linker, true);
     unregister_eh_frame_for_library(linker->img);
     unregister_custom_library_for_backtrace(linker->img);
   }
@@ -553,6 +625,8 @@ void linker_destroy(struct linker *linker) {
 
 /* INFO: Free resources related to the library without unloading it */
 void linker_abandon(struct linker *linker) {
+  if (linker->is_linked) _linker_release_atexit(linker, false);
+
   _linker_release_dependencies(linker, false, false);
 
   if (linker->img && linker->is_linked) {
@@ -1347,6 +1421,16 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
         return true;
       }
 
+      if ((r->type == R_GENERIC_GLOB_DAT || r->type == R_GENERIC_JUMP_SLOT) && strcmp(sym_name, "__cxa_atexit") == 0 &&
+          linker->atexit_slot_count < MAX_ATEXIT_SLOTS) {
+        LOGD("Special case for __cxa_atexit: recording handlers until the constructors ran");
+
+        *target_addr = (ElfW(Addr))_linker_record_atexit;
+        linker->atexit_slots[linker->atexit_slot_count++] = target_addr;
+
+        return true;
+      }
+
       switch (r->type) {
         case R_GENERIC_GLOB_DAT:
         case R_GENERIC_JUMP_SLOT: {
@@ -1950,6 +2034,28 @@ static void _linker_restore_protections(struct csoloader_elf *image) {
   free(page_protections);
 }
 
+/* INFO: Points __cxa_atexit back to libc, reapplying RELRO after the write. */
+static void _linker_restore_atexit_slots(struct linker *linker) {
+  for (int i = 0; i < linker->atexit_slot_count; i++) {
+    ElfW(Addr) *slot = linker->atexit_slots[i];
+    if (mprotect((void *)_page_start((uintptr_t)slot), system_page_size, PROT_READ | PROT_WRITE) != 0) {
+      LOGE("Failed to make __cxa_atexit slot %p of %s writable: %s", slot, linker->img->elf, strerror(errno));
+
+      continue;
+    }
+
+    *slot = (ElfW(Addr))__cxa_atexit;
+  }
+
+  for (int i = -1; i < linker->dep_count; i++) {
+    struct csoloader_elf *img = i == -1 ? linker->img : linker->dependencies[i].img;
+    if (i >= 0 && !linker->dependencies[i].is_manual_load) continue;
+
+    if (_linker_protect_gnu_relro(img) != 0)
+      LOGW("Failed to apply GNU RELRO protection to %s", img->elf);
+  }
+}
+
 bool linker_link(struct linker *linker) {
   struct carray *loaded_libs = carray_create(64);
   if (!loaded_libs) {
@@ -2196,6 +2302,8 @@ bool linker_link(struct linker *linker) {
   }
 
   _linker_call_constructors(linker->img);
+
+  _linker_restore_atexit_slots(linker);
 
   linker->is_linked = true;
 
